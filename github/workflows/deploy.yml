@@ -1,0 +1,133 @@
+name: Deployment
+on:
+  push:
+    branches:
+      - main # Trigger the workflow on pushes to the main branch
+      #
+
+jobs:
+  lint:
+    runs-on: server-aws
+    timeout-minutes: 3
+    steps:
+          
+      - name: Get code
+        uses: actions/checkout@v4
+        # Fetch the latest code from the main branch
+
+      - name: Load & cache dependencies
+        id: cache-deps
+        uses: ./.github/actions/cached-deps
+        with:
+          caching: "false"
+        # Disable caching for the linting step
+
+      - name: Output information
+        run: echo "Cache used? ${{ steps.cache-deps.outputs.used-cache }}"
+        # Output information about whether the cache was used
+
+      - name: Lint code
+        run: npm run lint
+        # Run the linting process to check code quality
+
+  test:
+    runs-on: server-aws
+    continue-on-error: true
+    needs: lint
+    steps:
+
+      - name: Get code
+        uses: actions/checkout@v4
+        # Fetch the latest code from the main branch
+
+      - name: Load & cache dependencies
+        uses: ./.github/actions/cached-deps
+        # Load and cache dependencies for testing
+
+      - name: Test code
+        id: run-tests
+        run: npm run test
+        # Run the test suite
+
+      - name: Upload test report
+        if: failure() && steps.run-tests.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report
+          path: test.json
+        # Upload the test report if the tests fail
+
+  build:
+    runs-on: server-aws
+    needs: [lint, test]
+    timeout-minutes: 3
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        # Fetch the latest code from the main branch
+
+      - name: Determine caching behavior
+        id: caching
+        run: |
+          echo "Commit message: ${{ github.event.head_commit.message }}"
+          if [[ "${{ github.event.head_commit.message }}" == *"[no-cache]"* ]]; then
+            echo "cache=false" >> $GITHUB_ENV
+          else
+            echo "cache=true" >> $GITHUB_ENV
+          fi
+        # Determine whether to use cache based on commit message
+
+      - name: Load & cache dependencies
+        uses: ./.github/actions/cached-deps
+        with:
+          caching: ${{ env.cache }}
+        # Load and cache dependencies if caching is enabled
+
+      - name: Build website
+        run: |
+          set -e # Fail fast on errors
+          npm run build
+        # Build the website; fail if build fails
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-files
+          path: dist
+        # Upload build artifacts for further use or deployment
+
+      - name: Send email notification on failure
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: Build Failure Notification
+          to: durgaganesh18041996@gmail.com
+          from: ${{ secrets.MAIL_USERNAME }}
+          body: |
+            The build process failed for repository ${{ github.repository }}.
+            Latest commit message: ${{ github.event.head_commit.message }}
+            Build logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        # Sends an email notification if the build fails
+
+  deploy:
+    needs: build
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-files
+          path: ./dist
+
+      - name: Deploy to server
+        run: |
+          echo "${{ secrets.SUDO_PASSWORD }}" | sudo -S cp -r ./dist/* /var/www/html/your-app/
+          echo "${{ secrets.SUDO_PASSWORD }}" | sudo -S systemctl restart nginx
